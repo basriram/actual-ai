@@ -1,0 +1,28 @@
+I want to categorize the given bank transaction.
+
+Payee: {{#if payee}}{{payee}}{{else}}{{importedPayee}}{{/if}}
+Memo: {{description}}
+Amount: {{#if (eq type "Income")}}${{amount}}{{else}}-${{amount}}{{/if}}
+Account type: creditcard
+Date: {{date}}
+
+Existing categories by group:
+{{#each categoryGroups}}
+GROUP: {{name}} (ID: "{{id}}")
+{{#each categories}}
+* {{name}} (ID: "{{id}}")
+{{/each}}
+{{/each}}
+
+IMPORTANT: You MUST respond with ONLY a valid JSON object using this structure:
+{
+  "type": "existing"|"new"|"rule",
+  "categoryId": "string",
+  "newCategory": {
+    "name": "string",
+    "groupName": "string",
+    "groupIsNew": boolean
+  }
+}
+
+DO NOT output any text before or after the JSON. Your entire response must be a valid, parsable JSON object.

@@ -40,7 +40,13 @@ export const googleApiKey = process.env.GOOGLE_GENERATIVE_AI_API_KEY ?? '';
 export const ollamaBaseURL = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434/api';
 export const ollamaModel = process.env.OLLAMA_MODEL ?? 'llama3.1';
 export const dataDir = '/tmp/actual-ai/';
-export const promptTemplate = process.env.PROMPT_TEMPLATE ?? defaultPromptTemplate;
+// Fork: allow loading the prompt template from a file (mounted into the
+// container) instead of inlining the whole template in an env var.
+const promptTemplateFile = process.env.PROMPT_TEMPLATE_FILE;
+const filePromptTemplate = promptTemplateFile
+  ? fs.readFileSync(promptTemplateFile, 'utf8').trim()
+  : undefined;
+export const promptTemplate = filePromptTemplate ?? process.env.PROMPT_TEMPLATE ?? defaultPromptTemplate;
 export const notGuessedTag = process.env.NOT_GUESSED_TAG ?? '#actual-ai-miss';
 export const guessedTag = process.env.GUESSED_TAG ?? '#actual-ai';
 export const groqApiKey = process.env.GROQ_API_KEY ?? '';
