@@ -46,7 +46,8 @@ const promptTemplateFile = process.env.PROMPT_TEMPLATE_FILE;
 const filePromptTemplate = promptTemplateFile
   ? fs.readFileSync(promptTemplateFile, 'utf8').trim()
   : undefined;
-export const promptTemplate = filePromptTemplate ?? process.env.PROMPT_TEMPLATE ?? defaultPromptTemplate;
+export const promptTemplate =
+  filePromptTemplate ?? process.env.PROMPT_TEMPLATE ?? defaultPromptTemplate;
 export const notGuessedTag = process.env.NOT_GUESSED_TAG ?? '#actual-ai-miss';
 export const guessedTag = process.env.GUESSED_TAG ?? '#actual-ai';
 export const groqApiKey = process.env.GROQ_API_KEY ?? '';
