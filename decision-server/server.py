@@ -14,10 +14,12 @@ Contract with actual-ai:
 - actual-ai renders PROMPT_TEMPLATE (see prompt-template.hbs) so the user
   message IS the decision-model "state" in the exact training format, and
   the category list lines carry  `* Name (ID: "id")`  pairs.
-- This server builds the choice criteria from those lines, scores every
-  category with the decision head (no text generation), maps the winning
-  category name back to its Actual category ID, and replies with the JSON
-  object actual-ai expects: {"type": "existing", "categoryId": "..."}.
+- The decision head is ALWAYS scored against the 199 labels it was trained
+  on (dataset/labels.json). Scoring against Actual's own category names
+  drops top-1 from ~82% to ~59%: 387 flat names full of near-synonyms
+  (Dining vs Restaurants, Print vs Printing (Business)) poison the choice
+  set. The winning training label is then bridged to the Actual category
+  ID by exact match, falling back to leaf-name match.
 """
 import json
 import os
@@ -29,6 +31,8 @@ from pydantic import BaseModel
 import uvicorn
 
 MODEL_DIR = os.environ.get("DECISION_MODEL_DIR", "/models/quicken-decision-lora")
+LABELS_FILE = os.environ.get("DECISION_LABELS",
+                             "/home/sriram/quicken-decision/dataset/labels.json")
 MAX_SEQ_LENGTH = int(os.environ.get("DECISION_MAX_SEQ_LENGTH", "6144"))
 HOST = os.environ.get("DECISION_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DECISION_PORT", "8100"))
@@ -37,7 +41,20 @@ PORT = int(os.environ.get("DECISION_PORT", "8100"))
 CATEGORY_LINE = re.compile(r'^\*\s*(.+?)\s*\(ID:\s*"([^"]+)"\)\s*$', re.M)
 
 app = FastAPI()
-_state = {"model": None, "tokenizer": None}
+_state = {"model": None, "tokenizer": None, "labels": None}
+
+
+def training_labels():
+    """The 199 labels the decision head was trained on.
+
+    The choice set must stay exactly as trained: scoring against Actual's
+    flat category names (387 of them, full of near-synonyms like Dining vs
+    Restaurants) drops top-1 from 82.5% to 59% - classic distractor
+    poisoning. Predictions are then bridged to Actual IDs by leaf name.
+    """
+    if _state["labels"] is None:
+        _state["labels"] = json.load(open(LABELS_FILE))
+    return _state["labels"]
 
 
 class ChatRequest(BaseModel):
@@ -131,7 +148,7 @@ def chat_completions(req: ChatRequest):
                     "bank/credit card transaction, output exactly one category "
                     "label from the household's Quicken taxonomy."
                 ),
-                "criteria": {name: name for name, _cid in pairs},
+                "criteria": {label: label for label in training_labels()},
             }
         }
         answers = run_blocking(lambda: FastDecisionModel_predict(
