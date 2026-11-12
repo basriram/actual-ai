@@ -33,6 +33,9 @@ import uvicorn
 MODEL_DIR = os.environ.get("DECISION_MODEL_DIR", "/models/quicken-decision-lora")
 LABELS_FILE = os.environ.get("DECISION_LABELS",
                              "/home/sriram/quicken-decision/dataset/labels.json")
+CATEGORY_MAP_FILE = os.environ.get(
+    "DECISION_CATEGORY_MAP",
+    "/home/sriram/quicken-decision/dataset/category_map.json")
 MAX_SEQ_LENGTH = int(os.environ.get("DECISION_MAX_SEQ_LENGTH", "6144"))
 HOST = os.environ.get("DECISION_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DECISION_PORT", "8100"))
@@ -50,7 +53,7 @@ TRANSFER_PATTERN = re.compile(
 TRANSFER_EXEMPT = re.compile(r"INTEREST|FEE|SEC TRANSFER", re.I)
 
 app = FastAPI()
-_state = {"model": None, "tokenizer": None, "labels": None}
+_state = {"model": None, "tokenizer": None, "labels": None, "map": None}
 
 
 def training_labels():
@@ -99,17 +102,47 @@ def parse_state_and_categories(prompt: str):
     return state, pairs
 
 
+def category_map():
+    """Quicken training label -> Actual category name (explicit alias table).
+
+    Actual's taxonomy is nothing like the training one: "Dining Out" vs
+    "Food & Dining : Restaurants", "Transfers", "Credit Card Payments".
+    Leaf-name matching alone misses most of it, so an explicit map (with
+    null = leave uncategorized) is the authoritative bridge.
+    """
+    if _state["map"] is None:
+        try:
+            _state["map"] = json.load(open(CATEGORY_MAP_FILE))
+        except FileNotFoundError:
+            _state["map"] = {}
+    return _state["map"]
+
+
 def resolve_category(name, pairs):
     """Map a predicted label to an Actual category ID.
 
-    The decision head answers with one of the criteria names it was given,
-    so exact match normally wins. Leaf fallback (last path segment) is
-    insurance for name drift between training taxonomy and Actual's naming.
+    1. Explicit alias map (category_map.json): label -> Actual category name.
+       A null mapping means "leave uncategorized" (e.g. Transfers).
+    2. Exact name match, then leaf-name match, as fallback for labels the
+       map does not cover.
 
-    Returns (category_id, ambiguous). ambiguous=True when more than one
-    Actual category matches (same full name or same leaf), so dry-run logs
-    can surface mapping collisions instead of silently picking list order.
+    Returns (category_id, ambiguous).
     """
+    cmap = category_map()
+    if name in cmap:
+        target = cmap[name]
+        if target is None:
+            return None, False
+        for full, cid in pairs:
+            if full == target:
+                return cid, False
+        leaf = target.split(" : ")[-1].strip().lower()
+        matches = [cid for full, cid in pairs
+                   if full.split(" : ")[-1].strip().lower() == leaf]
+        if matches:
+            return matches[0], len(matches) > 1
+        return None, False
+
     exact = [cid for full, cid in pairs if full == name]
     if exact:
         return exact[0], len(exact) > 1
