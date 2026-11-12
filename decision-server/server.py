@@ -40,6 +40,11 @@ PORT = int(os.environ.get("DECISION_PORT", "8100"))
 # `* Category Name (ID: "cat-uuid")` lines rendered by prompt-template.hbs
 CATEGORY_LINE = re.compile(r'^\*\s*(.+?)\s*\(ID:\s*"([^"]+)"\)\s*$', re.M)
 
+# Payee/memo patterns that identify transfers: they are not a classification
+# problem and Actual handles them natively. ~9% of this household's volume.
+TRANSFER_PATTERN = re.compile(
+    r"PAYMENT THANK|TRANSFER|BILL PAY|AUTOPAY|AUTOBANK", re.I)
+
 app = FastAPI()
 _state = {"model": None, "tokenizer": None, "labels": None}
 
@@ -133,10 +138,43 @@ def run_blocking(fn):
 _LOCK = threading.Lock()
 
 
+def transfer_like(state):
+    """Deterministic transfer detection on payee/memo, before any GPU work.
+
+    ~9% of this household's transactions are transfers; they are not a
+    classification problem, and Actual handles them natively. Matching here
+    saves the model call entirely and keeps logs clean.
+    """
+    m = re.search(r"^Payee:\s*(.+)$", state, re.M)
+    memo = re.search(r"^Memo:\s*(.+)$", state, re.M)
+    text = " ".join(x.group(1) for x in (m, memo) if x)
+    return bool(TRANSFER_PATTERN.search(text))
+
+
+def chat_response(content, req):
+    return {
+        "id": "chatcmpl-decision",
+        "object": "chat.completion",
+        "created": 0,
+        "model": req.model,
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant",
+                                 "content": json.dumps(content)}}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
     prompt = next((m["content"] for m in reversed(req.messages)
                    if m.get("role") == "user"), "")
+    # Transfer prefilter: no model load, no GPU time, clean rule response.
+    if os.environ.get("TRANSFER_PREFILTER", "on") == "on":
+        state_pre = prompt.split("Existing categories by group:")[0].strip()
+        if transfer_like(state_pre):
+            return chat_response({"type": "rule",
+                                  "ruleName": "decision: transfer (leave uncategorized)"},
+                                 req)
     model, tokenizer = load_model()
     try:
         state, pairs = run_blocking(lambda: parse_state_and_categories(prompt))
@@ -155,12 +193,13 @@ def chat_completions(req: ChatRequest):
             model, tokenizer, state, questions))
         answer, probs = answers["category"]["answer"], answers["category"]["probabilities"]
         # Transfers: Actual Budget handles account-to-account transfers
-        # natively. TRANSFER_ACTION=skip leaves them unclassified (marked
+        # natively, and this household's budget has no Transfer category,
+        # so skip is the honest default: leave unclassified (marked
         # "not guessed" upstream, never re-processed) to avoid
-        # double-counting; the default "categorize" assigns the Transfer
-        # category ID so they stay visible in Actual.
+        # double-counting. Set TRANSFER_ACTION=categorize only if a real
+        # Transfer category exists in the budget.
         if answer.startswith("Transfer") and \
-                os.environ.get("TRANSFER_ACTION", "categorize") == "skip":
+                os.environ.get("TRANSFER_ACTION", "skip") == "skip":
             content = {"type": "existing", "categoryId": "",
                        "_skipped": answer}
         elif os.environ.get("TAX_GUARD", "on") == "on" and is_tax_sensitive(answer):
