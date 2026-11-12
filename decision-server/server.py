@@ -76,14 +76,31 @@ def resolve_category(name, name_to_id):
     Restaurants"), while Actual budgets often carry flat names ("Restaurants").
     Exact match first, then leaf-name match (last path segment), so a correct
     hierarchical prediction still lands on the flat Actual category.
+
+    Returns (category_id, ambiguous). ambiguous=True when more than one
+    Actual category shares the predicted leaf name - the caller surfaces
+    that in the response so dry-run logs are filterable instead of silently
+    picking whichever category came first.
     """
     if name in name_to_id:
-        return name_to_id[name]
+        return name_to_id[name], False
     leaf = name.split(" : ")[-1].strip()
-    for full, cid in name_to_id.items():
-        if full.split(" : ")[-1].strip() == leaf:
-            return cid
-    return None
+    matches = [cid for full, cid in name_to_id.items()
+               if full.split(" : ")[-1].strip() == leaf]
+    if not matches:
+        return None, False
+    return matches[0], len(matches) > 1
+
+
+# Categories whose misclassification has tax/audit consequences (business
+# expenses feed Schedule K-1 reimbursements, charity/medical feed itemized
+# deductions). Never auto-post these regardless of model confidence.
+TAX_SENSITIVE_PREFIXES = ("Business", "Charity", "Medical", "Insurance", "Tax")
+
+
+def is_tax_sensitive(name):
+    leaf = name.split(" : ")[-1].strip()
+    return any(leaf.startswith(p) for p in TAX_SENSITIVE_PREFIXES)
 
 
 def run_blocking(fn):
@@ -126,14 +143,23 @@ def chat_completions(req: ChatRequest):
                 os.environ.get("TRANSFER_ACTION", "categorize") == "skip":
             content = {"type": "existing", "categoryId": "",
                        "_skipped": answer}
+        elif os.environ.get("TAX_GUARD", "on") == "on" and is_tax_sensitive(answer):
+            # Tax-sensitive classes are routed to the review queue even when
+            # confidence is high: 76% exact accuracy on that slice is not
+            # good enough for deduction-relevant lines.
+            content = {"type": "existing", "categoryId": "",
+                       "_review": "tax_sensitive", "_predicted": answer,
+                       "_confidence": probs.get(answer)}
         else:
-            cid = resolve_category(answer, name_to_id)
+            cid, ambiguous = resolve_category(answer, name_to_id)
             if cid is None:
                 content = {"type": "existing", "categoryId": "",
                            "_unmapped": answer}
             else:
                 content = {"type": "existing", "categoryId": cid,
                            "_confidence": probs.get(answer)}
+                if ambiguous:
+                    content["_ambiguous"] = True
     except Exception as e:  # noqa: BLE001 - respond as "not guessed"
         content = {"type": "existing", "categoryId": "", "_error": str(e)}
     body = {
