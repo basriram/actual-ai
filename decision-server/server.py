@@ -45,6 +45,10 @@ CATEGORY_LINE = re.compile(r'^\*\s*(.+?)\s*\(ID:\s*"([^"]+)"\)\s*$', re.M)
 TRANSFER_PATTERN = re.compile(
     r"PAYMENT THANK|TRANSFER|BILL PAY|AUTOPAY|AUTOBANK", re.I)
 
+# Income/fee lines that merely contain "Transfer" in their payee - they must
+# reach the model (interest income, deductible bank fees, securities moves).
+TRANSFER_EXEMPT = re.compile(r"INTEREST|FEE|SEC TRANSFER", re.I)
+
 app = FastAPI()
 _state = {"model": None, "tokenizer": None, "labels": None}
 
@@ -144,10 +148,18 @@ def transfer_like(state):
     ~9% of this household's transactions are transfers; they are not a
     classification problem, and Actual handles them natively. Matching here
     saves the model call entirely and keeps logs clean.
+
+    Exemptions matter: "Transfer Interest From CD Account" is interest
+    income and "Online External Transfer Fee" is a deductible bank fee -
+    those must reach the model. Counterparty-account payees (e.g. "Common
+    Chase Checking") do NOT match here; they are caught post-prediction by
+    the Transfer rule response.
     """
     m = re.search(r"^Payee:\s*(.+)$", state, re.M)
     memo = re.search(r"^Memo:\s*(.+)$", state, re.M)
     text = " ".join(x.group(1) for x in (m, memo) if x)
+    if TRANSFER_EXEMPT.search(text):
+        return False
     return bool(TRANSFER_PATTERN.search(text))
 
 
@@ -192,16 +204,21 @@ def chat_completions(req: ChatRequest):
         answers = run_blocking(lambda: FastDecisionModel_predict(
             model, tokenizer, state, questions))
         answer, probs = answers["category"]["answer"], answers["category"]["probabilities"]
-        # Transfers: Actual Budget handles account-to-account transfers
-        # natively, and this household's budget has no Transfer category,
-        # so skip is the honest default: leave unclassified (marked
-        # "not guessed" upstream, never re-processed) to avoid
-        # double-counting. Set TRANSFER_ACTION=categorize only if a real
-        # Transfer category exists in the budget.
-        if answer.startswith("Transfer") and \
-                os.environ.get("TRANSFER_ACTION", "skip") == "skip":
-            content = {"type": "existing", "categoryId": "",
-                       "_skipped": answer}
+        # Transfers predicted by the head (counterparty-account payees that
+        # the prefilter cannot catch) and labels with no matching Actual
+        # category are not writable by definition - answer with a rule
+        # response instead of an empty categoryId that makes actual-ai
+        # throw. TRANSFER_ACTION=categorize tries to map a real Transfer
+        # category first, for budgets that have one.
+        if answer.startswith("Transfer"):
+            cid, _ = resolve_category(answer, pairs) if \
+                os.environ.get("TRANSFER_ACTION", "skip") == "categorize" else (None, False)
+            if cid:
+                content = {"type": "existing", "categoryId": cid,
+                           "_confidence": probs.get(answer)}
+            else:
+                content = {"type": "rule",
+                           "ruleName": "decision: transfer (leave uncategorized)"}
         elif os.environ.get("TAX_GUARD", "on") == "on" and is_tax_sensitive(answer):
             # Tax-sensitive classes are routed to the review queue even when
             # confidence is high: 76% exact accuracy on that slice is not
@@ -212,8 +229,8 @@ def chat_completions(req: ChatRequest):
         else:
             cid, ambiguous = resolve_category(answer, pairs)
             if cid is None:
-                content = {"type": "existing", "categoryId": "",
-                           "_unmapped": answer}
+                content = {"type": "rule",
+                           "ruleName": f"decision: no matching category ({answer})"}
             else:
                 content = {"type": "existing", "categoryId": cid,
                            "_confidence": probs.get(answer)}
