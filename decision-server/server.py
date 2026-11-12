@@ -69,6 +69,23 @@ def parse_state_and_categories(prompt: str):
     return state, pairs
 
 
+def resolve_category(name, name_to_id):
+    """Map a predicted label to an Actual category ID.
+
+    The model was trained on hierarchical Quicken labels ("Food & Dining :
+    Restaurants"), while Actual budgets often carry flat names ("Restaurants").
+    Exact match first, then leaf-name match (last path segment), so a correct
+    hierarchical prediction still lands on the flat Actual category.
+    """
+    if name in name_to_id:
+        return name_to_id[name]
+    leaf = name.split(" : ")[-1].strip()
+    for full, cid in name_to_id.items():
+        if full.split(" : ")[-1].strip() == leaf:
+            return cid
+    return None
+
+
 def run_blocking(fn):
     """FastAPI sync def endpoints already run in a threadpool; model calls are
     single-threaded per process, so serialize them."""
@@ -110,8 +127,13 @@ def chat_completions(req: ChatRequest):
             content = {"type": "existing", "categoryId": "",
                        "_skipped": answer}
         else:
-            content = {"type": "existing", "categoryId": name_to_id[answer],
-                       "_confidence": probs.get(answer)}
+            cid = resolve_category(answer, name_to_id)
+            if cid is None:
+                content = {"type": "existing", "categoryId": "",
+                           "_unmapped": answer}
+            else:
+                content = {"type": "existing", "categoryId": cid,
+                           "_confidence": probs.get(answer)}
     except Exception as e:  # noqa: BLE001 - respond as "not guessed"
         content = {"type": "existing", "categoryId": "", "_error": str(e)}
     body = {
