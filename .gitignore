@@ -4,3 +4,8 @@ dist/
 
 .env
 *.log
+
+# Python artifacts (decision-server)
+__pycache__/
+*.pyc
+decision-server/unsloth_compiled_cache/
