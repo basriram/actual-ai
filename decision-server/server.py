@@ -59,8 +59,12 @@ def load_model():
 
 
 def parse_state_and_categories(prompt: str):
-    """Split the rendered prompt into decision state + name->id map."""
-    pairs = {name.strip(): cid for name, cid in CATEGORY_LINE.findall(prompt)}
+    """Split the rendered prompt into decision state + [(name, id)] pairs.
+
+    A list, not a dict: Actual budgets can contain two categories with the
+    same name (different groups), and a dict would silently collapse them.
+    """
+    pairs = [(name.strip(), cid) for name, cid in CATEGORY_LINE.findall(prompt)]
     if not pairs:
         raise ValueError("prompt carries no `* Name (ID: \"...\")` category lines")
     # The state is everything before the "Existing categories by group:" marker
@@ -69,27 +73,26 @@ def parse_state_and_categories(prompt: str):
     return state, pairs
 
 
-def resolve_category(name, name_to_id):
+def resolve_category(name, pairs):
     """Map a predicted label to an Actual category ID.
 
-    The model was trained on hierarchical Quicken labels ("Food & Dining :
-    Restaurants"), while Actual budgets often carry flat names ("Restaurants").
-    Exact match first, then leaf-name match (last path segment), so a correct
-    hierarchical prediction still lands on the flat Actual category.
+    The decision head answers with one of the criteria names it was given,
+    so exact match normally wins. Leaf fallback (last path segment) is
+    insurance for name drift between training taxonomy and Actual's naming.
 
     Returns (category_id, ambiguous). ambiguous=True when more than one
-    Actual category shares the predicted leaf name - the caller surfaces
-    that in the response so dry-run logs are filterable instead of silently
-    picking whichever category came first.
+    Actual category matches (same full name or same leaf), so dry-run logs
+    can surface mapping collisions instead of silently picking list order.
     """
-    if name in name_to_id:
-        return name_to_id[name], False
+    exact = [cid for full, cid in pairs if full == name]
+    if exact:
+        return exact[0], len(exact) > 1
     leaf = name.split(" : ")[-1].strip()
-    matches = [cid for full, cid in name_to_id.items()
-               if full.split(" : ")[-1].strip() == leaf]
-    if not matches:
+    leaf_matches = [cid for full, cid in pairs
+                    if full.split(" : ")[-1].strip() == leaf]
+    if not leaf_matches:
         return None, False
-    return matches[0], len(matches) > 1
+    return leaf_matches[0], len(leaf_matches) > 1
 
 
 # Categories whose misclassification has tax/audit consequences (business
@@ -119,7 +122,7 @@ def chat_completions(req: ChatRequest):
                    if m.get("role") == "user"), "")
     model, tokenizer = load_model()
     try:
-        state, name_to_id = run_blocking(lambda: parse_state_and_categories(prompt))
+        state, pairs = run_blocking(lambda: parse_state_and_categories(prompt))
         questions = {
             "category": {
                 "type": "choice",
@@ -128,7 +131,7 @@ def chat_completions(req: ChatRequest):
                     "bank/credit card transaction, output exactly one category "
                     "label from the household's Quicken taxonomy."
                 ),
-                "criteria": {name: name for name in name_to_id},
+                "criteria": {name: name for name, _cid in pairs},
             }
         }
         answers = run_blocking(lambda: FastDecisionModel_predict(
@@ -151,7 +154,7 @@ def chat_completions(req: ChatRequest):
                        "_review": "tax_sensitive", "_predicted": answer,
                        "_confidence": probs.get(answer)}
         else:
-            cid, ambiguous = resolve_category(answer, name_to_id)
+            cid, ambiguous = resolve_category(answer, pairs)
             if cid is None:
                 content = {"type": "existing", "categoryId": "",
                            "_unmapped": answer}
